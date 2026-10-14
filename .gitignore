@@ -8,3 +8,4 @@ work/
 *.pt
 *.tar
 .ipynb_checkpoints/
+.DS_Store
