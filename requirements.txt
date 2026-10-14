@@ -1,0 +1,9 @@
+numpy
+pandas
+scikit-learn
+tqdm
+requests
+librosa
+soundfile
+resampy
+panns-inference

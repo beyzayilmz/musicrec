@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+embeddings/
+runs/
+work/
+*.npz
+*.pth
+*.pt
+*.tar
+.ipynb_checkpoints/
