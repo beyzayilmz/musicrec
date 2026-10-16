@@ -7,3 +7,4 @@ librosa
 soundfile
 resampy
 panns-inference
+scipy
