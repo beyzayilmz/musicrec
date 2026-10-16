@@ -1,14 +1,13 @@
-"""Ortak yardımcılar: TSV okuma, etiket sözlüğü, ses klibi yükleme, Dataset."""
+"""Ortak yardımcılar: TSV okuma, etiket sözlüğü, tam şarkı yükleme ve pencereleme."""
 import csv
 import random
-from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 SEED = 42
-CLIP_SEC = 30
+WIN_SEC = 30
 SR_PANNS = 32000
 SR_VGGISH = 16000
 DATASET = "autotagging_moodtheme"
@@ -55,55 +54,65 @@ def build_vocab(rows_by_split) -> list:
     return sorted({t for rows in rows_by_split.values() for r in rows for t in r["tags"]})
 
 
-def fit_length(y: np.ndarray, n: int) -> np.ndarray:
-    """Klibi n örneğe getirir: kısaysa tekrarlar (sessizlikle seyreltmez), uzunsa keser."""
-    if len(y) == 0:
+def make_windows(y: np.ndarray, win: int, max_windows: int) -> np.ndarray:
+    """Şarkıyı win örneklik pencerelere böler, çıktı (n, win).
+
+    - Şarkı win'den kısaysa tekrarlanarak tek pencereye uzatılır.
+    - Aksi halde ceil(uzunluk / win) pencere, başlangıçları eşit aralıklı seçilir:
+      şarkının tamamı örtülür, pencereler en fazla birkaç saniye çakışır.
+    - max_windows > 0 ve şarkı daha uzunsa pencereler yine eşit aralıkla seyreltilir.
+    - Tek pencere kalırsa şarkının ortasındaki pencere alınır (max_windows=1 -> eski 30 sn davranışı).
+    """
+    n = len(y)
+    if n == 0:
         raise ValueError("boş ses")
-    if len(y) >= n:
-        return y[:n]
-    return np.resize(y, n)
+    if n <= win:
+        return np.resize(y, win)[None, :]
+    k = int(np.ceil(n / win))
+    if max_windows and k > max_windows:
+        k = max_windows
+    if k == 1:
+        starts = np.array([(n - win) // 2])
+    else:
+        starts = np.linspace(0, n - win, k).round().astype(int)
+    return np.stack([y[s:s + win] for s in starts])
 
 
-def load_clip(path, duration: float) -> dict:
-    """Şarkının ortasından CLIP_SEC saniyelik kesiti bir kez çözer, iki örnekleme hızında döndürür."""
+def to_16k(w32: np.ndarray) -> np.ndarray:
+    """32 kHz pencereleri (n, örnek) tam 2 katı oranla 16 kHz'e indirir."""
+    from scipy.signal import resample_poly
+
+    assert SR_PANNS == 2 * SR_VGGISH
+    return resample_poly(w32, 1, 2, axis=-1).astype(np.float32)
+
+
+def load_track(path) -> np.ndarray:
+    """Şarkının tamamını 32 kHz mono olarak çözer (tek decode, tek yeniden örnekleme)."""
     import librosa
 
-    offset = max(0.0, duration / 2 - CLIP_SEC / 2)
-    y, sr = librosa.load(str(path), sr=None, mono=True, offset=offset, duration=CLIP_SEC)
-    out = {}
-    for target in (SR_PANNS, SR_VGGISH):
-        out[target] = y if sr == target else librosa.resample(y, orig_sr=sr, target_sr=target)
-    return out
+    y, _ = librosa.load(str(path), sr=SR_PANNS, mono=True)
+    return y.astype(np.float32)
 
 
-class ClipDataset(Dataset):
-    """items: (track_id, dosya_yolu, süre) listesi."""
+class TrackDataset(Dataset):
+    """items: (track_id, dosya_yolu, süre) listesi.
 
-    def __init__(self, items):
+    Her eleman (track_id, pencereler, hata) döner: pencereler (n, 30 sn @ 32 kHz) float32 tensör,
+    hata yoksa None, çözme başarısızsa pencereler None ve hata metni dolu.
+    """
+
+    def __init__(self, items, max_windows: int):
         self.items = items
+        self.max_windows = max_windows
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, i):
-        tid, path, dur = self.items[i]
+        tid, path, _dur = self.items[i]
         try:
-            clips = load_clip(path, dur)
-            w32 = fit_length(clips[SR_PANNS], SR_PANNS * CLIP_SEC)
-            w16 = clips[SR_VGGISH]
-            return tid, w32.astype(np.float32), w16.astype(np.float32), True
-        except Exception:
-            return (
-                tid,
-                np.zeros(SR_PANNS * CLIP_SEC, dtype=np.float32),
-                np.zeros(SR_VGGISH, dtype=np.float32),
-                False,
-            )
-
-
-def collate(batch):
-    tids = [b[0] for b in batch]
-    w32 = np.stack([b[1] for b in batch])
-    w16 = [b[2] for b in batch]
-    oks = [b[3] for b in batch]
-    return tids, w32, w16, oks
+            y = load_track(path)
+            w = make_windows(y, WIN_SEC * SR_PANNS, self.max_windows)
+            return tid, torch.from_numpy(np.ascontiguousarray(w, dtype=np.float32)), None
+        except Exception as e:  # noqa: BLE001
+            return tid, None, f"{type(e).__name__}: {e}"

@@ -1,11 +1,10 @@
 __pycache__/
 *.pyc
-embeddings/
-runs/
+embeddings*/
+runs*/
 work/
 *.npz
 *.pth
 *.pt
 *.tar
 .ipynb_checkpoints/
-.DS_Store

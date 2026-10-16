@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""MTG-Jamendo için tar-tar embedding hattı (PANNs + VGGish, tek geçişte).
+"""MTG-Jamendo için tar-tar embedding hattı (PANNs + VGGish, tek geçişte, TAM ŞARKI).
 
-Her tar için: indir -> doğrula -> aç -> iki modelle embedding çıkar -> .npz yaz -> sesi sil.
+Her şarkı 30 sn'lik pencerelere bölünür (şarkının tamamı örtülür, en fazla --max-windows pencere),
+şarkı vektörü pencerelerin ortalamasıdır (VGGish: tüm karelerin ortalama+std'si).
+Her tar için: indir (bir sonraki tar arka planda iner) -> doğrula -> aç -> embedding -> .npz yaz -> sesi sil.
 Disk hiç dolmaz. Çıktıda var olan tar'lar atlanır, böylece Kaggle'da oturum/süre
 dolsa bile kaldığı yerden devam edilir (--prev-dir ile önceki çıktıyı ver).
 
@@ -19,6 +21,7 @@ import subprocess
 import sys
 import tarfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +30,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from common import DATASET, SPLITS, ClipDataset, build_vocab, collate, read_split
+from common import DATASET, SPLITS, WIN_SEC, TrackDataset, build_vocab, read_split, to_16k
 from extract_panns import PannsEmbedder
 from extract_vggish import VggishEmbedder
 
@@ -114,6 +117,19 @@ def save_npz(path: Path, ids, emb) -> None:
     os.replace(tmp, path)
 
 
+def check_config(prev_dir, out: Path, cfg: dict) -> None:
+    """Önceki çıktı farklı ayarlarla üretildiyse karıştırmamak için durur."""
+    if prev_dir:
+        pc = Path(prev_dir)
+        found = list(pc.rglob("config.json"))
+        if not found:
+            raise SystemExit(f"{prev_dir} içinde config.json yok: eski (30 sn kesit) çıktı olabilir, karıştırılamaz.")
+        old = json.loads(found[0].read_text())
+        if old != cfg:
+            raise SystemExit(f"Önceki çıktının ayarları farklı, devam edilemez.\n  önceki: {old}\n  şimdiki: {cfg}")
+    (out / "config.json").write_text(json.dumps(cfg, indent=1))
+
+
 def restore_prev(prev_dir, out: Path) -> None:
     if not prev_dir:
         return
@@ -137,25 +153,27 @@ def process_audio(audio_dir: Path, rows: dict, panns, vgg, args):
         if tid in rows:
             items.append((tid, p, rows[tid]["duration"]))
     loader = DataLoader(
-        ClipDataset(items), batch_size=args.batch_size, num_workers=args.num_workers,
-        collate_fn=collate, shuffle=False,
+        TrackDataset(items, args.max_windows), batch_size=None, num_workers=args.num_workers,
+        shuffle=False, prefetch_factor=2 if args.num_workers else None,
     )
-    ids, pe, ve, failed = [], [], [], []
-    for tids, w32, w16s, oks in tqdm(loader, desc="  embedding", leave=False):
-        batch_p = panns(w32)
-        for i, tid in enumerate(tids):
-            if not oks[i]:
-                failed.append(tid)
-                continue
-            try:
-                v = vgg(w16s[i])
-            except Exception:  # noqa: BLE001
-                failed.append(tid)
-                continue
-            ids.append(tid)
-            pe.append(batch_p[i])
-            ve.append(v)
-    return ids, pe, ve, failed, len(items)
+    ids, pe, ve, failed, nwin = [], [], [], [], 0
+    for tid, w32, err in tqdm(loader, desc="  embedding", leave=False):
+        if err is not None:
+            failed.append(tid)
+            continue
+        try:
+            w32 = w32.numpy()
+            p_vec = panns(w32)
+            v_vec = vgg(to_16k(w32))
+        except Exception as e:  # noqa: BLE001
+            print(f"  {tid}: embedding hatası {type(e).__name__}: {e}")
+            failed.append(tid)
+            continue
+        ids.append(tid)
+        pe.append(p_vec)
+        ve.append(v_vec)
+        nwin += len(w32)
+    return ids, pe, ve, failed, len(items), nwin
 
 
 def main():
@@ -170,7 +188,8 @@ def main():
     ap.add_argument("--source", default="mtg-fast", choices=list(URLS))
     ap.add_argument("--split", type=int, default=0)
     ap.add_argument("--max-hours", type=float, default=10.5, help="süre bütçesi; dolunca temiz çıkar")
-    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--panns-batch", type=int, default=16, help="PANNs'a aynı anda verilen pencere sayısı")
+    ap.add_argument("--max-windows", type=int, default=20, help="şarkı başına en fazla pencere (20 = 10 dk)")
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--limit-tars", type=int, default=0, help="test için ilk N tar")
     args = ap.parse_args()
@@ -182,6 +201,8 @@ def main():
     for m in ("panns", "vggish", "splits"):
         (out / m).mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
+    cfg = {"win_sec": WIN_SEC, "max_windows": args.max_windows, "pooling": "mean", "vggish": "mean+std"}
+    check_config(args.prev_dir, out, cfg)
     restore_prev(args.prev_dir, out)
 
     files = ensure_splits(mtg, args.split, args.dataset)
@@ -197,40 +218,63 @@ def main():
     if args.limit_tars:
         tars = tars[: args.limit_tars]
 
-    panns, vgg = PannsEmbedder(device), VggishEmbedder(device)
-    last, finished = 0.0, 0
-    for k, (name, sha) in enumerate(tars, 1):
-        stem = name.removesuffix(".tar")
-        if all((out / m / f"{stem}.npz").exists() for m in ("panns", "vggish")):
-            finished += 1
-            print(f"[{k}/{len(tars)}] {name}: zaten var, atlandı")
-            continue
-        if time.time() - t0 + last * 1.1 > args.max_hours * 3600:
-            print("Süre bütçesi doldu, temiz çıkılıyor. Kalan tar'lar için bu çıktıyı --prev-dir ile ver.")
-            break
-        ts = time.time()
-        tar_path = work / name
-        audio_dir = work / f"audio_{stem}"
-        try:
-            print(f"[{k}/{len(tars)}] {name}: indiriliyor...")
+    panns, vgg = PannsEmbedder(device, args.panns_batch), VggishEmbedder(device)
+    last, finished, n_ok, n_fail = 0.0, 0, 0, 0
+
+    def fetch(name, sha):
+        path = work / name
+        if not path.exists():
             url = URLS[args.source].format(dataset=args.dataset, dtype=args.dtype, name=name)
-            download(url, tar_path, sha)
-            audio_dir.mkdir(exist_ok=True)
-            safe_extract(tar_path, audio_dir)
-            tar_path.unlink(missing_ok=True)
-            ids, pe, ve, failed, total = process_audio(audio_dir, rows, panns, vgg, args)
-            save_npz(out / "panns" / f"{stem}.npz", ids, pe)
-            save_npz(out / "vggish" / f"{stem}.npz", ids, ve)
-            if failed:
-                with open(out / "failed.txt", "a") as f:
-                    f.write("\n".join(map(str, failed)) + "\n")
-            finished += 1
-            last = time.time() - ts
-            print(f"  {len(ids)}/{total} şarkı, {len(failed)} hata, {last / 60:.1f} dk, "
-                  f"toplam geçen {(time.time() - t0) / 3600:.2f} sa")
-        finally:
-            tar_path.unlink(missing_ok=True)
-            shutil.rmtree(audio_dir, ignore_errors=True)
+            download(url, path, sha)
+        return path
+
+    todo = [(n, h) for n, h in tars if not all((out / m / f"{n.removesuffix('.tar')}.npz").exists()
+                                                 for m in ("panns", "vggish"))]
+    finished = len(tars) - len(todo)
+    print(f"{finished} tar zaten hazır, {len(todo)} tar işlenecek.")
+    pool = ThreadPoolExecutor(max_workers=1)
+    fut = pool.submit(fetch, *todo[0]) if todo else None
+    try:
+        for k, (name, sha) in enumerate(todo):
+            stem = name.removesuffix(".tar")
+            if k > 0 and time.time() - t0 + last * 1.1 > args.max_hours * 3600:
+                print("Süre bütçesi doldu, temiz çıkılıyor. Kalan tar'lar için bu çıktıyı --prev-dir ile ver.")
+                break
+            ts = time.time()
+            audio_dir = work / f"audio_{stem}"
+            tar_path = work / name
+            try:
+                print(f"[{finished + 1}/{len(tars)}] {name}: indirme bekleniyor...")
+                tar_path = fut.result()
+                if k + 1 < len(todo):
+                    fut = pool.submit(fetch, *todo[k + 1])  # sonraki tar arka planda iner
+                audio_dir.mkdir(exist_ok=True)
+                safe_extract(tar_path, audio_dir)
+                tar_path.unlink(missing_ok=True)
+                ids, pe, ve, failed, total, nwin = process_audio(audio_dir, rows, panns, vgg, args)
+                if not ids:
+                    raise RuntimeError("bu tar'dan hiç embedding çıkmadı")
+                save_npz(out / "panns" / f"{stem}.npz", ids, pe)
+                save_npz(out / "vggish" / f"{stem}.npz", ids, ve)
+                if failed:
+                    with open(out / "failed.txt", "a") as f:
+                        f.write("\n".join(map(str, failed)) + "\n")
+                n_ok += len(ids)
+                n_fail += len(failed)
+                finished += 1
+                last = time.time() - ts
+                left = len(todo) - k - 1
+                print(f"  {len(ids)}/{total} şarkı, {nwin} pencere ({nwin / max(len(ids), 1):.1f}/şarkı), "
+                      f"{len(failed)} hata, {last / 60:.1f} dk, toplam geçen {(time.time() - t0) / 3600:.2f} sa, "
+                      f"kalan tahmini {left * last / 3600:.1f} sa")
+                if n_fail > 0.2 * (n_ok + n_fail) and n_ok + n_fail >= 100:
+                    raise SystemExit(f"Hata oranı %20'yi aştı ({n_fail}/{n_ok + n_fail}), durduruldu. "
+                                     "ffmpeg/librosa kurulumunu kontrol et.")
+            finally:
+                tar_path.unlink(missing_ok=True)
+                shutil.rmtree(audio_dir, ignore_errors=True)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     print(f"Bitti: {finished}/{len(tars)} tar tamam.")
     if finished == len(tars):
