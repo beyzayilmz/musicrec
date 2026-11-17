@@ -211,6 +211,7 @@ def train_one(prep, args, device, seed, save_dir):
     crop = int(round(args.crop_sec * tr["x"].shape[-1] / 30))
 
     best_pr, best_state, bad, best_epoch = -1.0, None, 0, 0
+    history = []  # epoch başına ortalama eğitim kaybı ve validation metrikleri (visualize.py çizer)
     t0 = time.time()
     eval_net = net
     if ema:  # EMA ağırlıkları ayrı bir kopyada değerlendirilir; en iyi epoch EMA'ya göre seçilir
@@ -220,6 +221,7 @@ def train_one(prep, args, device, seed, save_dir):
     for epoch in range(1, args.epochs + 1):
         net.train()
         perm = rng.permutation(len(tr["ids"]))
+        loss_sum, n_batches = 0.0, 0
         for i in range(0, len(perm), args.batch_size):
             idx = perm[i:i + args.batch_size]
             if len(idx) < 2:
@@ -246,16 +248,19 @@ def train_one(prep, args, device, seed, save_dir):
             sched.step()
             if ema:
                 ema.update(net)
+            loss_sum, n_batches = loss_sum + loss.item(), n_batches + 1
         if ema:
             eval_net.load_state_dict(ema.shadow)
         pv, _ = predict_songs(eval_net, va, mean, std, device)
         roc, pr = macro_metrics(va["y"], pv)
+        history.append({"epoch": epoch, "train_loss": loss_sum / max(1, n_batches), "val_roc_auc": roc,
+                        "val_pr_auc": pr})
         if pr > best_pr:
             best_pr, best_epoch, bad = pr, epoch, 0
             best_state = {k: v.detach().cpu().clone() for k, v in eval_net.state_dict().items()}
         else:
             bad += 1
-        print(f"[{name} seed {seed}] epoch {epoch:3d} loss {loss.item():.4f} val ROC-AUC {roc:.4f} PR-AUC {pr:.4f} "
+        print(f"[{name} seed {seed}] epoch {epoch:3d} loss {history[-1]['train_loss']:.4f} val ROC-AUC {roc:.4f} PR-AUC {pr:.4f} "
               f"({(time.time() - t0) / 60:.1f} dk)")
         if bad >= args.patience:
             print(f"[{name} seed {seed}] erken durdu (en iyi epoch {best_epoch})")
@@ -277,6 +282,7 @@ def train_one(prep, args, device, seed, save_dir):
               "embedding_dim": int(et.shape[1]), "n_params": int(n_params), "n_test": int(len(pt)),
               "n_tags_eval": int(valid.sum())}
     result.update(retrieval_eval(et, y_te))
+    result["history"] = history
     print(f"[{name} seed {seed}] TEST ROC-AUC {roc:.4f} PR-AUC {pr:.4f} (baseline {result['pr_auc_baseline']:.4f}) "
           f"F1 {f1:.4f} P@10 {result['p_at_10']:.4f} (rastgele {result['p_at_k_random']:.4f})")
 

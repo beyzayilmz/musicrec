@@ -181,8 +181,10 @@ def train_one(model_name, prep, args, device, seed, save_dir=None):
     y_train = torch.tensor(yt["train"], device=device)
     g = torch.Generator().manual_seed(seed)
     best_pr, best_state, bad, best_epoch = -1.0, None, 0, 0
+    history = []  # epoch başına ortalama eğitim kaybı ve validation metrikleri (visualize.py çizer)
     for epoch in range(1, args.epochs + 1):
         net.train()
+        loss_sum, n_batches = 0.0, 0
         perm = torch.randperm(len(x_train), generator=g).to(device)
         for i in range(0, len(perm), args.batch_size):
             idx = perm[i:i + args.batch_size]
@@ -190,7 +192,10 @@ def train_one(model_name, prep, args, device, seed, save_dir=None):
             loss = loss_fn(net(x_train[idx]), y_train[idx])
             loss.backward()
             opt.step()
+            loss_sum, n_batches = loss_sum + loss.item(), n_batches + 1
         roc, pr = macro_metrics(yt["validation"], predict(net, xt["validation"], device))
+        history.append({"epoch": epoch, "train_loss": loss_sum / max(1, n_batches), "val_roc_auc": roc,
+                        "val_pr_auc": pr})
         if pr > best_pr:
             best_pr, best_epoch, bad = pr, epoch, 0
             best_state = copy.deepcopy(net.state_dict())
@@ -221,6 +226,7 @@ def train_one(model_name, prep, args, device, seed, save_dir=None):
         result.update({"roc_auc_minpos": roc_m, "pr_auc_minpos": pr_m,
                        "f1_macro_minpos": float(f1_tag[vm].mean()), "n_tags_minpos": int(vm.sum())})
     result.update(retrieval_eval(xt["test"].numpy(), y_te))
+    result["history"] = history
     print(f"[{model_name} seed {seed}] TEST ROC-AUC {roc:.4f} PR-AUC {pr:.4f} (baseline {result['pr_auc_baseline']:.4f}) "
           f"F1 {f1:.4f} P@10 {result['p_at_10']:.4f} (rastgele {result['p_at_k_random']:.4f})")
 
