@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Sıfırdan (önceden eğitilmemiş) küçük CNN ile MTG-Jamendo mood/theme çok etiketli sınıflandırma.
+"""Sıfırdan (önceden eğitilmemiş) CNN ile MTG-Jamendo mood/theme çok etiketli sınıflandırma.
+
+Mimari --arch ile seçilir: small (~1.2 M, 4 blok), resnet18 veya resnet34 (bkz. resnet.py).
+ResNet'ler için önerilen ek düzenlileştirme: --ema (ağırlık EMA'sı), --drop-path, --mixup, --gain-db.
 
 Giriş: pipeline.py --models mel çıktısı (pencere başına 64 x 938 log-mel, float16).
 Eğitim: her epoch'ta her şarkıdan rastgele bir pencere, ondan rastgele bir --crop-sec saniyelik kesit,
@@ -7,10 +10,12 @@ SpecAugment (frekans + zaman maskesi), isteğe bağlı mixup. Değerlendirme: ş
 tam uzunlukta CNN'e verilir, olasılıklar (ve embedding'ler) şarkı başına ortalanır.
 Metrikler, eşik seçimi ve özet tablosu train.py ile aynıdır (aynı fonksiyonlar), böylece sonuçlar
 MLP/PANNs/VGGish tablosuyla doğrudan karşılaştırılır. Çıktı düzeni de aynıdır:
-<out-dir>/cnn/seed<N>/{results.json, per_tag.csv, model.pt}, summary.json, summary.md.
+<out-dir>/<model>/seed<N>/{results.json, per_tag.csv, model.pt}, summary.json, summary.md.
 
 Örnek:
     python src/train_cnn.py --emb-dir /kaggle/working/emb_mel --seeds 1 2 3 4 5
+    python src/train_cnn.py --emb-dir $EMB --arch resnet34 --epochs 80 --patience 15 --lr 1e-3 \
+        --mixup 0.3 --ema 0.999 --drop-path 0.1 --gain-db 6 --crop-sec 15 --pos-weight --seeds 1
 """
 import argparse
 import csv
@@ -25,6 +30,7 @@ import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
 
 from common import SPLITS, read_split, set_seed
+from resnet import EMA, AudioResNet
 from train import best_thresholds, macro_metrics, resolve_emb_dir, retrieval_eval, summarize, valid_mask
 
 
@@ -113,6 +119,16 @@ class SmallCNN(nn.Module):
         return (out, e) if return_emb else out
 
 
+MODEL_NAME = {"small": "cnn", "resnet18": "resnet18", "resnet34": "resnet34"}
+
+
+def build_model(cfg, n_tags):
+    """cfg: arch, width, dropout, drop_path, n_mels (model.pt içine de bu sözlük yazılır)."""
+    if cfg["arch"] == "small":
+        return SmallCNN(n_tags, cfg["width"], cfg["dropout"])
+    return AudioResNet(n_tags, cfg["arch"], cfg["n_mels"], cfg["width"], cfg["drop_path"], cfg["dropout"])
+
+
 # ----------------------------------------------------------------------------- eğitim yardımcıları
 
 def spec_augment(x, freq_mask=8, time_mask=40, n_masks=2):
@@ -166,9 +182,15 @@ def train_one(prep, args, device, seed, save_dir):
     rng = np.random.default_rng(seed)
     data, vocab, mean, std = prep["data"], prep["vocab"], prep["mean"], prep["std"]
     tr, va, te = data["train"], data["validation"], data["test"]
-    net = SmallCNN(len(vocab), args.width, args.dropout).to(device)
+    name = MODEL_NAME[args.arch]
+    cfg = {"arch": args.arch, "width": args.width, "dropout": args.dropout, "drop_path": args.drop_path,
+           "n_mels": int(tr["x"].shape[1])}
+    net = build_model(cfg, len(vocab)).to(device)
+    if device == "cuda":
+        net = net.to(memory_format=torch.channels_last)
+    ema = EMA(net, args.ema) if args.ema > 0 else None
     n_params = sum(p.numel() for p in net.parameters())
-    print(f"[cnn seed {seed}] parametre sayısı: {n_params / 1e6:.2f} M")
+    print(f"[{name} seed {seed}] parametre sayısı: {n_params / 1e6:.2f} M")
 
     pos = tr["y"].sum(0)
     neg = len(tr["y"]) - pos
@@ -177,7 +199,11 @@ def train_one(prep, args, device, seed, save_dir):
         pos_w = torch.tensor(np.clip(neg / np.maximum(pos, 1), 1.0, args.pos_weight_max), dtype=torch.float32,
                              device=device)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_w)
-    opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # BN ve bias parametrelerine weight decay uygulanmaz (yalnızca konv/doğrusal ağırlıklar)
+    decay = [p for p in net.parameters() if p.ndim > 1]
+    no_decay = [p for p in net.parameters() if p.ndim <= 1]
+    opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.weight_decay},
+                             {"params": no_decay, "weight_decay": 0.0}], lr=args.lr)
     steps_per_epoch = int(np.ceil(len(tr["ids"]) / args.batch_size))
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=args.epochs * steps_per_epoch,
                                                 pct_start=0.15)
@@ -186,6 +212,11 @@ def train_one(prep, args, device, seed, save_dir):
 
     best_pr, best_state, bad, best_epoch = -1.0, None, 0, 0
     t0 = time.time()
+    eval_net = net
+    if ema:  # EMA ağırlıkları ayrı bir kopyada değerlendirilir; en iyi epoch EMA'ya göre seçilir
+        eval_net = build_model(cfg, len(vocab)).to(device)
+        if device == "cuda":
+            eval_net = eval_net.to(memory_format=torch.channels_last)
     for epoch in range(1, args.epochs + 1):
         net.train()
         perm = rng.permutation(len(tr["ids"]))
@@ -195,6 +226,8 @@ def train_one(prep, args, device, seed, save_dir):
                 continue
             x, y = sample_batch(tr, idx, crop, rng)
             x, y = x.to(device), y.to(device)
+            if args.gain_db > 0:  # dB ölçeğinde rastgele kazanç = sabit kayma
+                x = x + (torch.rand(len(x), 1, 1, 1, device=device) * 2 - 1) * args.gain_db
             x = (x - mean) / std
             x = spec_augment(x, args.freq_mask, args.time_mask)
             if args.mixup > 0:
@@ -205,22 +238,30 @@ def train_one(prep, args, device, seed, save_dir):
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=device == "cuda"):
                 loss = loss_fn(net(x).float(), y)
             scaler.scale(loss).backward()
+            if args.clip > 0:
+                scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(net.parameters(), args.clip)
             scaler.step(opt)
             scaler.update()
             sched.step()
-        pv, _ = predict_songs(net, va, mean, std, device)
+            if ema:
+                ema.update(net)
+        if ema:
+            eval_net.load_state_dict(ema.shadow)
+        pv, _ = predict_songs(eval_net, va, mean, std, device)
         roc, pr = macro_metrics(va["y"], pv)
         if pr > best_pr:
             best_pr, best_epoch, bad = pr, epoch, 0
-            best_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+            best_state = {k: v.detach().cpu().clone() for k, v in eval_net.state_dict().items()}
         else:
             bad += 1
-        print(f"[cnn seed {seed}] epoch {epoch:3d} loss {loss.item():.4f} val ROC-AUC {roc:.4f} PR-AUC {pr:.4f} "
+        print(f"[{name} seed {seed}] epoch {epoch:3d} loss {loss.item():.4f} val ROC-AUC {roc:.4f} PR-AUC {pr:.4f} "
               f"({(time.time() - t0) / 60:.1f} dk)")
         if bad >= args.patience:
-            print(f"[cnn seed {seed}] erken durdu (en iyi epoch {best_epoch})")
+            print(f"[{name} seed {seed}] erken durdu (en iyi epoch {best_epoch})")
             break
 
+    net = eval_net
     net.load_state_dict(best_state)
     pv, _ = predict_songs(net, va, mean, std, device)
     pt, et = predict_songs(net, te, mean, std, device)
@@ -231,19 +272,19 @@ def train_one(prep, args, device, seed, save_dir):
     roc, pr = macro_metrics(y_te, pt)
     f1 = float(f1_tag[valid].mean())
     prevalence = y_te.mean(0)
-    result = {"model": "cnn", "seed": seed, "roc_auc": roc, "pr_auc": pr, "f1_macro": f1,
+    result = {"model": name, "seed": seed, "roc_auc": roc, "pr_auc": pr, "f1_macro": f1,
               "pr_auc_baseline": float(prevalence[valid].mean()), "best_epoch": best_epoch,
               "embedding_dim": int(et.shape[1]), "n_params": int(n_params), "n_test": int(len(pt)),
               "n_tags_eval": int(valid.sum())}
     result.update(retrieval_eval(et, y_te))
-    print(f"[cnn seed {seed}] TEST ROC-AUC {roc:.4f} PR-AUC {pr:.4f} (baseline {result['pr_auc_baseline']:.4f}) "
+    print(f"[{name} seed {seed}] TEST ROC-AUC {roc:.4f} PR-AUC {pr:.4f} (baseline {result['pr_auc_baseline']:.4f}) "
           f"F1 {f1:.4f} P@10 {result['p_at_10']:.4f} (rastgele {result['p_at_k_random']:.4f})")
 
     out = Path(save_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "results.json").write_text(json.dumps(result, indent=1))
     torch.save({"state_dict": best_state, "mean": mean, "std": std, "vocab": vocab, "thr": thr,
-                "width": args.width}, out / "model.pt")
+                "width": args.width, "cfg": cfg}, out / "model.pt")
     np.savez_compressed(out / "test_probs_emb.npz", ids=te["ids"], probs=pt, emb=et.astype(np.float16))
     with open(out / "per_tag.csv", "w", newline="") as f:
         w = csv.writer(f)
@@ -261,22 +302,31 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--emb-dir", required=True, help="pipeline.py --models mel çıktısı (splits/, vocab.json, mel/)")
     ap.add_argument("--out-dir", default="runs_cnn")
+    ap.add_argument("--arch", choices=list(MODEL_NAME), default="small",
+                    help="small (küçük CNN), resnet18, resnet34")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--patience", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--weight-decay", type=float, default=1e-2)
-    ap.add_argument("--width", type=int, default=32, help="ilk blok kanal sayısı (32 -> 32-64-128-256)")
+    ap.add_argument("--width", type=int, default=None,
+                    help="ilk aşama kanal sayısı; varsayılan small: 32 (32-64-128-256), resnet: 64 (64-128-256-512)")
     ap.add_argument("--dropout", type=float, default=0.5)
     ap.add_argument("--crop-sec", type=float, default=10.0, help="eğitimde rastgele kesit uzunluğu (sn)")
     ap.add_argument("--freq-mask", type=int, default=8)
     ap.add_argument("--time-mask", type=int, default=40)
     ap.add_argument("--mixup", type=float, default=0.0, help="mixup beta parametresi (0 = kapalı)")
+    ap.add_argument("--drop-path", type=float, default=0.1, help="resnet: stochastic depth oranı (son blok)")
+    ap.add_argument("--ema", type=float, default=0.0, help="ağırlık EMA katsayısı, ör. 0.999 (0 = kapalı)")
+    ap.add_argument("--gain-db", type=float, default=0.0, help="eğitimde ±dB rastgele kazanç (0 = kapalı)")
+    ap.add_argument("--clip", type=float, default=0.0, help="gradyan normu kırpma (0 = kapalı)")
     ap.add_argument("--pos-weight", action="store_true", help="BCE'de etiket başına pos_weight (train.py ile aynı)")
     ap.add_argument("--pos-weight-max", type=float, default=20.0)
     ap.add_argument("--seeds", type=int, nargs="+", default=[42])
     ap.add_argument("--max-train", type=int, default=0, help="duman testi için ilk N eğitim şarkısı")
     args = ap.parse_args()
+    if args.width is None:
+        args.width = 32 if args.arch == "small" else 64
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     emb_dir = resolve_emb_dir(args.emb_dir)
@@ -293,8 +343,8 @@ def main():
     prep = {"data": data, "vocab": vocab, "mean": mean, "std": std}
 
     out_root = Path(args.out_dir)
-    results = [train_one(prep, args, device, sd, out_root / "cnn" / f"seed{sd}") for sd in args.seeds]
-    agg, diff, md = summarize(results, ["cnn"], args.seeds)
+    results = [train_one(prep, args, device, sd, out_root / MODEL_NAME[args.arch] / f"seed{sd}") for sd in args.seeds]
+    agg, diff, md = summarize(results, [MODEL_NAME[args.arch]], args.seeds)
     print("\n=== Test sonuçları (macro) ===")
     print(md)
     (out_root / "summary.json").write_text(json.dumps({"runs": results, "aggregate": agg}, indent=1))
